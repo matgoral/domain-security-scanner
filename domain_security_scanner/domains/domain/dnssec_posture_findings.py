@@ -24,7 +24,7 @@ def _algorithm_names(analysis: DnssecAlgorithmPostureAnalysis) -> str:
     for item in analysis.dnskey_algorithms:
         label = item.mnemonic or f"algorithm {item.number}"
         values.append(f"{label} ({item.number}: {item.signing_posture.value})")
-    return ", ".join(values) or "brak"
+    return ", ".join(values) or "niezaobserwowany"
 
 
 def _digest_names(analysis: DnssecAlgorithmPostureAnalysis) -> str:
@@ -32,7 +32,7 @@ def _digest_names(analysis: DnssecAlgorithmPostureAnalysis) -> str:
     for item in analysis.ds_digests:
         label = item.description or f"digest {item.number}"
         values.append(f"{label} ({item.number}: {item.delegation_posture.value})")
-    return ", ".join(values) or "brak"
+    return ", ".join(values) or "niezaobserwowany"
 
 
 def algorithm_policy_finding(
@@ -69,7 +69,7 @@ def algorithm_policy_finding(
         return DnssecPostureFinding(
             "DNSSEC algorithm policy",
             "info",
-            "Zaobserwowane algorytmy są dozwolone przez bieżący snapshot polityki, "
+            "Zaobserwowane parametry DNSSEC są dozwolone przez bieżący snapshot polityki, "
             "ale nie wszystkie mają status recommended. "
             + details,
             applicable=False,
@@ -77,7 +77,7 @@ def algorithm_policy_finding(
     return DnssecPostureFinding(
         "DNSSEC algorithm policy",
         "pass",
-        "Zaobserwowane algorytmy DNSKEY i digesty DS należą do bieżącego recommended set. "
+        "Zaobserwowane parametry DNSSEC należą do bieżącego recommended set. "
         + details,
     )
 

@@ -19,6 +19,13 @@ from .delegation_analysis import (
     GLUE_PRESENT,
     DelegationAnalysis,
 )
+from .dns_reconciliation import reconcile_delegation
+from .dns_scoring import (
+    DELEGATED_AUTHORITY_WEIGHT,
+    DELEGATION_CONSISTENCY_WEIGHT,
+    NAME_SERVER_REDUNDANCY_WEIGHT,
+    NAMESERVER_ADDRESSABILITY_WEIGHT,
+)
 
 
 @dataclass(frozen=True)
@@ -51,24 +58,25 @@ def _by_authority_status(
 def build_delegation_findings(
     evidence: ParentDelegationEvidence,
     analysis: DelegationAnalysis,
+    authoritative_analysis=None,
 ) -> tuple[DelegationFinding, ...]:
-    """Convert delegation analysis into conservative Domain checks.
+    """Convert delegation analysis into impact-calibrated Domain checks.
 
-    Only the existing nameserver-redundancy weight is retained here. New
-    delegation checks are intentionally non-scoring until the v1.3 scoring
-    integration work in issue #20.
+    Only findings backed by positive, sufficiently complete evidence reduce the
+    score. Missing/timeout evidence remains unknown and is excluded by setting
+    ``applicable=False``.
     """
     findings: list[DelegationFinding] = []
 
-    # Replaces the former RDAP-nameserver-count check with actual parent-side
-    # delegation evidence while preserving its existing 3-point score weight.
+    reconciled = reconcile_delegation(analysis, authoritative_analysis)
+
     if not evidence.available or not analysis.parent_nameservers:
         findings.append(
             DelegationFinding(
                 "Name server redundancy",
                 "unknown",
                 "Nie udało się wiarygodnie ustalić delegowanego zestawu NS po stronie rodzica.",
-                3,
+                NAME_SERVER_REDUNDANCY_WEIGHT,
                 0,
                 False,
             )
@@ -79,8 +87,8 @@ def build_delegation_findings(
                 "Name server redundancy",
                 "pass",
                 f"Delegacja rodzica wskazuje {len(analysis.parent_nameservers)} serwery NS.",
-                3,
-                3,
+                NAME_SERVER_REDUNDANCY_WEIGHT,
+                NAME_SERVER_REDUNDANCY_WEIGHT,
             )
         )
     else:
@@ -89,7 +97,7 @@ def build_delegation_findings(
                 "Name server redundancy",
                 "warn",
                 f"Delegacja rodzica wskazuje tylko jeden serwer NS: {analysis.parent_nameservers[0]}.",
-                3,
+                NAME_SERVER_REDUNDANCY_WEIGHT,
                 0,
             )
         )
@@ -100,46 +108,71 @@ def build_delegation_findings(
                 "DNS delegation consistency",
                 "unknown",
                 "Brak wiarygodnej odpowiedzi delegacyjnej rodzica; zgodność parent/child nie może zostać oceniona.",
-                applicable=False,
+                DELEGATION_CONSISTENCY_WEIGHT,
+                0,
+                False,
             )
         )
-    elif analysis.parent_child_consistent is True:
+    elif reconciled.consistent is True:
         findings.append(
             DelegationFinding(
                 "DNS delegation consistency",
                 "pass",
-                "Delegacja rodzica jest zgodna z potwierdzonymi autorytatywnymi zestawami NS strefy.",
+                (
+                    "Delegacja rodzica jest zgodna z potwierdzonymi autorytatywnymi zestawami NS strefy."
+                    if reconciled.consistency_source == "delegation_probe"
+                    else "Delegacja rodzica jest zgodna z później potwierdzonymi autorytatywnymi apex NS RRsetami wszystkich delegowanych serwerów."
+                ),
+                DELEGATION_CONSISTENCY_WEIGHT,
+                DELEGATION_CONSISTENCY_WEIGHT,
             )
         )
-    elif analysis.parent_child_consistent is False:
+    elif reconciled.consistent is False:
         details: list[str] = []
-        if analysis.missing_from_child:
+        if reconciled.missing_from_child:
             details.append(
-                "brak po stronie dziecka: " + _names(analysis.missing_from_child)
+                "brak po stronie dziecka: " + _names(reconciled.missing_from_child)
             )
-        if analysis.extra_in_child:
+        if reconciled.extra_in_child:
             details.append(
-                "tylko po stronie dziecka: " + _names(analysis.extra_in_child)
+                "tylko po stronie dziecka: " + _names(reconciled.extra_in_child)
             )
         suffix = "; ".join(details)
         if suffix:
             suffix = " " + suffix + "."
-        findings.append(
-            DelegationFinding(
-                "DNS delegation consistency",
-                "warn",
-                "Zaobserwowano różnicę między delegacją rodzica a autorytatywnym zestawem NS."
-                + suffix
-                + " Może to być stan przejściowy podczas migracji DNS.",
+
+        if reconciled.complete:
+            findings.append(
+                DelegationFinding(
+                    "DNS delegation consistency",
+                    "fail",
+                    "Potwierdzone autorytatywne odpowiedzi wszystkich ocenionych delegowanych NS nie są zgodne z delegacją rodzica."
+                    + suffix,
+                    DELEGATION_CONSISTENCY_WEIGHT,
+                    0,
+                )
             )
-        )
+        else:
+            findings.append(
+                DelegationFinding(
+                    "DNS delegation consistency",
+                    "warn",
+                    "Zaobserwowano różnicę między delegacją rodzica a dostępnym autorytatywnym zestawem NS."
+                    + suffix
+                    + " Materiał child NS jest niepełny, więc wynik może odzwierciedlać stan przejściowy podczas migracji DNS.",
+                    DELEGATION_CONSISTENCY_WEIGHT,
+                    DELEGATION_CONSISTENCY_WEIGHT / 2,
+                )
+            )
     else:
         findings.append(
             DelegationFinding(
                 "DNS delegation consistency",
                 "unknown",
                 "Dostępne dowody child NS są niepełne; nie potwierdzono ani zgodności, ani trwałej niezgodności delegacji.",
-                applicable=False,
+                DELEGATION_CONSISTENCY_WEIGHT,
+                0,
+                False,
             )
         )
 
@@ -149,7 +182,9 @@ def build_delegation_findings(
                 "Delegated nameserver authority",
                 "unknown",
                 "Brak wystarczających dowodów do oceny autorytatywności delegowanych serwerów NS.",
-                applicable=False,
+                DELEGATED_AUTHORITY_WEIGHT,
+                0,
+                False,
             )
         )
     else:
@@ -171,9 +206,11 @@ def build_delegation_findings(
                 DelegationFinding(
                     "Delegated nameserver authority",
                     "fail",
-                    "Delegowane serwery odpowiedziały bez potwierdzenia autorytatywności dla strefy: "
+                    "Potwierdzono delegowane serwery, które odpowiadają dla strefy bez autorytatywnej obsługi: "
                     + _names(lame)
                     + ".",
+                    DELEGATED_AUTHORITY_WEIGHT,
+                    0,
                 )
             )
         elif mixed or no_ns:
@@ -184,7 +221,7 @@ def build_delegation_findings(
                 )
             if no_ns:
                 details.append(
-                    "AA=1 bez oczekiwanego apex NS: " + _names(no_ns)
+                    "autorytatywna odpowiedź bez oczekiwanego apex NS: " + _names(no_ns)
                 )
             findings.append(
                 DelegationFinding(
@@ -193,19 +230,44 @@ def build_delegation_findings(
                     "Nie wszystkie potwierdzone odpowiedzi delegowanych NS mają spójny stan autorytatywny; "
                     + "; ".join(details)
                     + ".",
+                    DELEGATED_AUTHORITY_WEIGHT,
+                    DELEGATED_AUTHORITY_WEIGHT / 2,
                 )
             )
         elif unknown:
-            findings.append(
-                DelegationFinding(
-                    "Delegated nameserver authority",
-                    "unknown",
-                    "Nie udało się potwierdzić autorytatywności wszystkich delegowanych NS; niepełne dowody dotyczą: "
-                    + _names(unknown)
-                    + ".",
-                    applicable=False,
+            confirmed = set(reconciled.authority_confirmed_servers)
+            expected = {
+                str(item.name).strip().lower().rstrip(".")
+                for item in analysis.nameservers
+            }
+            originally_authoritative = {
+                str(item.name).strip().lower().rstrip(".")
+                for item in analysis.nameservers
+                if item.authority_status == AUTHORITY_AUTHORITATIVE
+            }
+            if expected and expected <= (confirmed | originally_authoritative):
+                findings.append(
+                    DelegationFinding(
+                        "Delegated nameserver authority",
+                        "pass",
+                        "Każdy delegowany serwer NS został potwierdzony autorytatywnie przez bezpośredni apex NS RRset z AA=1; późniejszy materiał uzupełnił niejednoznaczne wcześniejsze próby delegacyjne.",
+                        DELEGATED_AUTHORITY_WEIGHT,
+                        DELEGATED_AUTHORITY_WEIGHT,
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    DelegationFinding(
+                        "Delegated nameserver authority",
+                        "unknown",
+                        "Nie udało się potwierdzić autorytatywności wszystkich delegowanych NS; niepełne dowody dotyczą: "
+                        + _names(unknown)
+                        + ".",
+                        DELEGATED_AUTHORITY_WEIGHT,
+                        0,
+                        False,
+                    )
+                )
         elif all(
             item.authority_status == AUTHORITY_AUTHORITATIVE
             for item in analysis.nameservers
@@ -215,6 +277,8 @@ def build_delegation_findings(
                     "Delegated nameserver authority",
                     "pass",
                     "Każdy oceniony delegowany serwer NS potwierdził autorytatywną odpowiedź dla strefy.",
+                    DELEGATED_AUTHORITY_WEIGHT,
+                    DELEGATED_AUTHORITY_WEIGHT,
                 )
             )
         else:
@@ -223,7 +287,9 @@ def build_delegation_findings(
                     "Delegated nameserver authority",
                     "unknown",
                     "Stan autorytatywności delegowanych serwerów NS jest niejednoznaczny.",
-                    applicable=False,
+                    DELEGATED_AUTHORITY_WEIGHT,
+                    0,
+                    False,
                 )
             )
 
@@ -233,7 +299,9 @@ def build_delegation_findings(
                 "Nameserver addressability",
                 "unknown",
                 "Brak wystarczających dowodów do oceny adresów A/AAAA delegowanych NS.",
-                applicable=False,
+                NAMESERVER_ADDRESSABILITY_WEIGHT,
+                0,
+                False,
             )
         )
     else:
@@ -252,9 +320,11 @@ def build_delegation_findings(
                 DelegationFinding(
                     "Nameserver addressability",
                     "fail",
-                    "Delegowane serwery NS nie mają potwierdzonego użytecznego adresu A/AAAA ani glue: "
+                    "Potwierdzono delegowane serwery NS bez użytecznego adresu A/AAAA ani delegacyjnego glue: "
                     + _names(missing)
                     + ".",
+                    NAMESERVER_ADDRESSABILITY_WEIGHT,
+                    0,
                 )
             )
         elif unknown:
@@ -265,7 +335,9 @@ def build_delegation_findings(
                     "Nie udało się wiarygodnie ustalić adresów wszystkich delegowanych NS: "
                     + _names(unknown)
                     + ".",
-                    applicable=False,
+                    NAMESERVER_ADDRESSABILITY_WEIGHT,
+                    0,
+                    False,
                 )
             )
         else:
@@ -274,6 +346,8 @@ def build_delegation_findings(
                     "Nameserver addressability",
                     "pass",
                     "Każdy delegowany serwer NS ma co najmniej jeden użyteczny adres z DNS lub delegacyjnego glue.",
+                    NAMESERVER_ADDRESSABILITY_WEIGHT,
+                    NAMESERVER_ADDRESSABILITY_WEIGHT,
                 )
             )
 

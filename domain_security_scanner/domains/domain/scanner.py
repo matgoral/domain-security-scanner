@@ -6,6 +6,8 @@ from ...constants import COMMON_DNS_TYPES, TIMEOUT
 from ...utils import days_until, fallback_root_domain
 from .caa import collect_caa_policy
 from .delegation_findings import build_delegation_findings
+from .dns_scoring import CAA_MALFORMED_WEIGHT
+from .dns_zone_recovery import build_dns_zone_recovery, recover_delegation_findings
 
 
 class DomainScanMixin:
@@ -175,7 +177,19 @@ class DomainScanMixin:
         if evidence is None or analysis is None:
             return
 
-        for finding in build_delegation_findings(evidence, analysis):
+        findings = build_delegation_findings(
+            evidence,
+            analysis,
+            getattr(self, "authoritative_dns_analysis", None),
+        )
+        self.dns_zone_recovery = build_dns_zone_recovery(
+            getattr(self, "rdap", None),
+            getattr(self, "encrypted_dns", None),
+            getattr(self, "encrypted_dnssec_validation", None),
+        )
+        findings = recover_delegation_findings(findings, self.dns_zone_recovery)
+
+        for finding in findings:
             self.add_check(
                 "Domain",
                 finding.name,
@@ -222,6 +236,12 @@ class DomainScanMixin:
                 f"Wykryto efektywny RRset CAA dla {effective_name}, ale nie wszystkie "
                 f"rekordy udało się bezpiecznie sparsować.",
                 3, 0, False
+            )
+            self.add_check(
+                "Domain", "CAA policy syntax", "warn",
+                f"W efektywnym RRset CAA dla {effective_name} wykryto {len(syntax_errors)} "
+                "rekord(y) o nieprawidłowej składni. Polityka wymaga korekty i ponownej weryfikacji.",
+                CAA_MALFORMED_WEIGHT, 0
             )
             return
 
@@ -270,7 +290,7 @@ class DomainScanMixin:
                 f"W efektywnym RRset CAA wykryto {len(malformed_values)} nieprawidłowe "
                 "wartości rozpoznanych właściwości. Nieprawidłowe issue/issuewild są "
                 "traktowane przez RFC 8659 jak pusty issuer-domain-name.",
-                0, 0
+                CAA_MALFORMED_WEIGHT, 0
             )
 
         critical_unknown = analysis.get("critical_unknown_tags", [])
