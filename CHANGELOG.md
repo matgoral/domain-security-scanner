@@ -6,6 +6,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-30
+
 ### Added
 
 - Add `--json-only` to skip PDF generation while preserving the normal structured JSON report.
